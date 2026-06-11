@@ -1,7 +1,7 @@
 // test/images.test.js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, sign as cryptoSign, createHash } from 'node:crypto';
+import { sign as cryptoSign, createHash, createPrivateKey, X509Certificate } from 'node:crypto';
 
 import {
   parseDockerImages,
@@ -15,8 +15,12 @@ import {
   buildImportCommand,
   computeLayerMessage,
   verifySignature,
+  verifyCertChain,
+  splitPemCertificates,
+  loadTrustedRoots,
   SIGNATURE_LABEL,
-  _resetKeyCache,
+  CERTCHAIN_LABEL,
+  EMBEDDED_ROOT_CA_PEM,
 } from '../lib/images.js';
 
 test('parseDockerImages parses JSON lines and converts size', () => {
@@ -169,19 +173,55 @@ test('normalizeInspect returns null for missing values', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Signature verification
+// Signature & certificate-chain verification
 // ---------------------------------------------------------------------------
 
-// Generate a throwaway Ed25519 keypair once for all signature tests.
-const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+// Fixed Ed25519 fixtures generated with openssl: a self-signed root CA and a
+// leaf certificate signed by it, plus the leaf's private key. Using fixtures
+// (rather than generating certs at runtime) keeps the tests dependency-free.
+const CA_CERT_PEM = `-----BEGIN CERTIFICATE-----
+MIIBqTCCAVugAwIBAgIURm/ss5EsgxhiDvnon0WVkAiILi0wBQYDK2VwMEExCzAJ
+BgNVBAYTAkRFMQ0wCwYDVQQKDARUZXN0MQwwCgYDVQQLDANEZXYxFTATBgNVBAMM
+DHRlc3Qtcm9vdC1jYTAgFw0yNjA2MTEwODU4MjBaGA8yMTI2MDUxODA4NTgyMFow
+QTELMAkGA1UEBhMCREUxDTALBgNVBAoMBFRlc3QxDDAKBgNVBAsMA0RldjEVMBMG
+A1UEAwwMdGVzdC1yb290LWNhMCowBQYDK2VwAyEA1ASLM2/ZCZnXmzZ4jQfQryN6
+zgHhCkBsY9dBRHHC0AejYzBhMB0GA1UdDgQWBBTsQt2Co7uiJHe80mJXQy+8itAi
+lzAfBgNVHSMEGDAWgBTsQt2Co7uiJHe80mJXQy+8itAilzAPBgNVHRMBAf8EBTAD
+AQH/MA4GA1UdDwEB/wQEAwIBBjAFBgMrZXADQQCidj4gPXmZaQlTHPr7lD0S3O/w
+zYPm3T9a6R88qwML5PhJT3JTK1n7d7oXF8ZXrEQOTV46ZYk4VLK0RM1R4OgE
+-----END CERTIFICATE-----`;
 
-/**
- * Sign the canonical layer message with the test private key and return the
- * base64-encoded signature (as it would appear in the image label).
- */
+const LEAF_CERT_PEM = `-----BEGIN CERTIFICATE-----
+MIIBhTCCATegAwIBAgIUXwJnzEUVPbln9vIX4oX5xC6/hKgwBQYDK2VwMEExCzAJ
+BgNVBAYTAkRFMQ0wCwYDVQQKDARUZXN0MQwwCgYDVQQLDANEZXYxFTATBgNVBAMM
+DHRlc3Qtcm9vdC1jYTAgFw0yNjA2MTEwODU4MjBaGA8yMTI2MDUxODA4NTgyMFow
+PjELMAkGA1UEBhMCREUxDTALBgNVBAoMBFRlc3QxDDAKBgNVBAsMA0RldjESMBAG
+A1UEAwwJdGVzdC1sZWFmMCowBQYDK2VwAyEAEnbdwzLI40Sm+E/1WjrDnL7Ks2jV
+OCf6dVCaSOazfgCjQjBAMB0GA1UdDgQWBBT0pfOhZ5alw6rjCr2wZIc6UKDdazAf
+BgNVHSMEGDAWgBTsQt2Co7uiJHe80mJXQy+8itAilzAFBgMrZXADQQAmjAPUFToO
+b6P5q6dMqzPH/g9JmODhYRjzK7wiUcnJOh+Cz4CU8x/Bl1w+WhA7EcyHN3mofKKD
+zRyWOWvWYL8F
+-----END CERTIFICATE-----`;
+
+const LEAF_KEY_PEM = `-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIM3EK9IA/X4y8E7rnyIhBBxnMeGzJQrUJ39a2Uhey8XM
+-----END PRIVATE KEY-----`;
+
+const leafPrivateKey = createPrivateKey(LEAF_KEY_PEM);
+const caCert = new X509Certificate(CA_CERT_PEM);
+const trustedRoots = [caCert];
+// The certchain label is the base64 of the (leaf-first) PEM bundle.
+const CHAIN_B64 = Buffer.from(LEAF_CERT_PEM).toString('base64');
+
+/** Sign the canonical layer message with the leaf private key (base64). */
 function signLayers(layers) {
   const message = computeLayerMessage(layers);
-  return cryptoSign(null, message, privateKey).toString('base64');
+  return cryptoSign(null, message, leafPrivateKey).toString('base64');
+}
+
+/** Build the label map for a signed image. */
+function signedLabels(layers, { chain = CHAIN_B64 } = {}) {
+  return { [SIGNATURE_LABEL]: signLayers(layers), [CERTCHAIN_LABEL]: chain };
 }
 
 test('computeLayerMessage produces deterministic hex-digest bytes', () => {
@@ -193,61 +233,112 @@ test('computeLayerMessage produces deterministic hex-digest bytes', () => {
   assert.equal(msg.toString('utf8'), expected);
 });
 
+test('splitPemCertificates splits a bundle into individual certs', () => {
+  const bundle = `${LEAF_CERT_PEM}\n${CA_CERT_PEM}\n`;
+  const parts = splitPemCertificates(bundle);
+  assert.equal(parts.length, 2);
+  assert.ok(parts[0].includes('BEGIN CERTIFICATE'));
+  assert.equal(splitPemCertificates('no certs here').length, 0);
+});
+
+test('verifyCertChain validates a leaf against its trusted root', () => {
+  const leaf = new X509Certificate(LEAF_CERT_PEM);
+  assert.deepEqual(verifyCertChain(leaf, [], trustedRoots), { ok: true });
+});
+
+test('verifyCertChain rejects a leaf with no trusted root', () => {
+  const leaf = new X509Certificate(LEAF_CERT_PEM);
+  const result = verifyCertChain(leaf, [], []);
+  assert.equal(result.ok, false);
+  assert.ok(result.reason);
+});
+
+test('verifyCertChain rejects a leaf that does not chain to the root', () => {
+  const leaf = new X509Certificate(LEAF_CERT_PEM);
+  // Use an unrelated CA (the embedded one) as the only trusted root.
+  const unrelated = [new X509Certificate(EMBEDDED_ROOT_CA_PEM)];
+  const result = verifyCertChain(leaf, [], unrelated);
+  assert.equal(result.ok, false);
+  assert.ok(result.reason);
+});
+
 test('verifySignature returns "unsigned" when label is absent', () => {
-  const result = verifySignature(null, ['sha256:aaa'], publicKey);
+  const result = verifySignature(null, ['sha256:aaa'], trustedRoots);
   assert.equal(result.status, 'unsigned');
   assert.equal(result.reason, undefined);
 });
 
 test('verifySignature returns "unsigned" for empty labels', () => {
-  const result = verifySignature({}, ['sha256:aaa'], publicKey);
+  const result = verifySignature({}, ['sha256:aaa'], trustedRoots);
   assert.equal(result.status, 'unsigned');
 });
 
 test('verifySignature returns "valid" for a correctly signed image', () => {
-  const layers = [
-    'sha256:a344a5d4ea4bb4e872c37f9f39277655edec697e9b6e430e2a5331b57a8810e8',
-  ];
-  const sig = signLayers(layers);
-  const result = verifySignature({ [SIGNATURE_LABEL]: sig }, layers, publicKey);
+  const layers = ['sha256:a344a5d4ea4bb4e872c37f9f39277655edec697e9b6e430e2a5331b57a8810e8'];
+  const result = verifySignature(signedLabels(layers), layers, trustedRoots);
   assert.equal(result.status, 'valid');
+  assert.equal(result.signature, 'valid');
+  assert.equal(result.chain, 'valid');
 });
 
 test('verifySignature returns "valid" for multi-layer image', () => {
   const layers = ['sha256:aaa', 'sha256:bbb', 'sha256:ccc'];
-  const sig = signLayers(layers);
-  const result = verifySignature({ [SIGNATURE_LABEL]: sig }, layers, publicKey);
+  const result = verifySignature(signedLabels(layers), layers, trustedRoots);
   assert.equal(result.status, 'valid');
 });
 
 test('verifySignature returns "invalid" when signature does not match layers', () => {
   const layers = ['sha256:aaa'];
   const tamperedLayers = ['sha256:bbb'];
-  const sig = signLayers(layers);
-  const result = verifySignature({ [SIGNATURE_LABEL]: sig }, tamperedLayers, publicKey);
+  const result = verifySignature(signedLabels(layers), tamperedLayers, trustedRoots);
   assert.equal(result.status, 'invalid');
+  assert.equal(result.signature, 'invalid');
   assert.ok(result.reason);
 });
 
-test('verifySignature returns "invalid" when public key is null', () => {
+test('verifySignature returns "invalid" when the chain is not trusted', () => {
   const layers = ['sha256:aaa'];
-  const sig = signLayers(layers);
-  const result = verifySignature({ [SIGNATURE_LABEL]: sig }, layers, null);
+  // Valid signature, but no trusted root that the leaf chains to.
+  const result = verifySignature(signedLabels(layers), layers, [
+    new X509Certificate(EMBEDDED_ROOT_CA_PEM),
+  ]);
   assert.equal(result.status, 'invalid');
+  assert.equal(result.signature, 'valid');
+  assert.equal(result.chain, 'invalid');
   assert.ok(result.reason);
+});
+
+test('verifySignature returns "invalid" when certchain label is missing', () => {
+  const layers = ['sha256:aaa'];
+  const result = verifySignature({ [SIGNATURE_LABEL]: signLayers(layers) }, layers, trustedRoots);
+  assert.equal(result.status, 'invalid');
+  assert.ok(result.reason.includes(CERTCHAIN_LABEL));
 });
 
 test('verifySignature returns "invalid" when layers are empty', () => {
-  const sig = signLayers(['sha256:x']);
-  const result = verifySignature({ [SIGNATURE_LABEL]: sig }, [], publicKey);
+  const result = verifySignature(signedLabels(['sha256:x']), [], trustedRoots);
   assert.equal(result.status, 'invalid');
   assert.ok(result.reason);
 });
 
-test('verifySignature returns "invalid" for malformed base64 signature', () => {
-  const result = verifySignature({ [SIGNATURE_LABEL]: '!!!not-base64!!!' }, ['sha256:x'], publicKey);
-  // Buffer.from with 'base64' never throws; invalid chars are silently ignored,
-  // so the sig will simply not verify.
+test('verifySignature returns "invalid" for an unparseable certchain', () => {
+  const layers = ['sha256:x'];
+  const result = verifySignature(
+    { [SIGNATURE_LABEL]: signLayers(layers), [CERTCHAIN_LABEL]: Buffer.from('not a cert').toString('base64') },
+    layers,
+    trustedRoots,
+  );
   assert.equal(result.status, 'invalid');
   assert.ok(result.reason);
+});
+
+test('loadTrustedRoots falls back to the embedded CA', async () => {
+  const roots = await loadTrustedRoots('');
+  assert.ok(roots.length >= 1);
+  assert.ok(roots[0] instanceof X509Certificate);
+});
+
+test('loadTrustedRoots falls back to embedded CA for an unreadable path', async () => {
+  const roots = await loadTrustedRoots('/nonexistent/path/to/ca.pem');
+  assert.ok(roots.length >= 1);
 });

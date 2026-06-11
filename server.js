@@ -22,7 +22,7 @@ import {
   buildPullCommand,
   buildDeleteCommand,
   buildExportCommand,
-  loadPublicKey,
+  loadTrustedRoots,
   verifySignature,
 } from './lib/images.js';
 
@@ -30,7 +30,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '127.0.0.1';
-const PUBLIC_KEY_PATH = process.env.PUBLIC_KEY_PATH || path.join(__dirname, 'signing-key.pub.pem');
+// Optional override for the trust anchor. When unset (or unreadable) the
+// embedded root CA in lib/images.js is used. Mirrors image-verify.sh's -c flag.
+const ROOT_CA_PATH = process.env.ROOT_CA_PATH || '';
 
 // Hosts permitted in the Host/Origin headers (DNS-rebinding & CSRF guard).
 // Override with ALLOWED_HOSTS="a,b,c" when exposing the UI beyond localhost.
@@ -62,8 +64,8 @@ const MIME = {
 /** Active engine capabilities, set during startup. */
 let caps;
 
-/** Ed25519 public key object, loaded at startup. null when not configured. */
-let sigPublicKey = null;
+/** Trusted root CA certificates, loaded at startup. */
+let trustedRoots = [];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -296,7 +298,7 @@ async function handleDetails(req, res, id) {
   try {
     const result = await inspectImage(caps, id);
     const d = result.details;
-    result.signature = verifySignature(d.labels, d.layers, sigPublicKey);
+    result.signature = verifySignature(d.labels, d.layers, trustedRoots);
     sendJson(res, 200, result);
   } catch (err) {
     sendError(res, 500, `Failed to inspect image: ${(err.stderr || err.message || '').trim()}`);
@@ -322,7 +324,7 @@ async function handleVerify(req, res) {
       try {
         const result = await inspectImage(caps, id);
         const d = result.details;
-        return [result.id, verifySignature(d.labels, d.layers, sigPublicKey)];
+        return [result.id, verifySignature(d.labels, d.layers, trustedRoots)];
       } catch {
         // If inspect fails we cannot determine signature state.
         return [id, { status: 'invalid', reason: 'Inspect failed' }];
@@ -864,14 +866,16 @@ async function router(req, res) {
 async function main() {
   caps = await initialize();
 
-  sigPublicKey = await loadPublicKey(PUBLIC_KEY_PATH);
-  if (!sigPublicKey) {
+  trustedRoots = await loadTrustedRoots(ROOT_CA_PATH);
+  if (trustedRoots.length === 0) {
     console.warn(
-      `Warning: Ed25519 public key not found or invalid at ${PUBLIC_KEY_PATH}.\n` +
-        `         Signed images will show as invalid. Set PUBLIC_KEY_PATH to override.`,
+      'Warning: no trusted root CA could be loaded.\n' +
+        '         Signed images will show as invalid. Set ROOT_CA_PATH to override.',
     );
+  } else if (ROOT_CA_PATH) {
+    console.log(`Trusted root CA loaded from ${ROOT_CA_PATH} (${trustedRoots.length} cert(s))`);
   } else {
-    console.log(`Signature verification key loaded from ${PUBLIC_KEY_PATH}`);
+    console.log(`Using embedded trusted root CA (${trustedRoots.length} cert(s))`);
   }
 
   const server = http.createServer((req, res) => {
