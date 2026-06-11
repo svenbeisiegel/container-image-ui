@@ -17,16 +17,34 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 -i IMAGE -c ROOT_CA_PEM [-r LABEL_PREFIX] [-n CTR_NS]
+Usage: $0 -i IMAGE [-c ROOT_CA_PEM] [-r LABEL_PREFIX] [-n CTR_NS]
 
   -i IMAGE         image reference to verify (as it appears in its store)
   -c ROOT_CA_PEM   root CA certificate (PEM) used as the trust anchor
+                   (optional; falls back to the embedded CA if omitted)
   -r LABEL_PREFIX  reverse-DNS label prefix (default: org.mitel.imagesign)
   -n CTR_NS        containerd namespace for ctr
                    (default: \$CONTAINERD_NAMESPACE or "k8s.io")
 EOF
   exit 2
 }
+
+# Hardcoded fallback CA, used when no -c ROOT_CA_PEM is given on the command
+# line. Replace the placeholder below with your internal root CA certificate.
+EMBEDDED_CA="$(cat <<'EOF'
+-----BEGIN CERTIFICATE-----
+MIIBizCCAT2gAwIBAgIEJvSEJzAFBgMrZXAwTDELMAkGA1UEBhMCREUxDjAMBgNV
+BAoTBU1pdGVsMRQwEgYDVQQLEwtEZXZlbG9wbWVudDEXMBUGA1UEAxMOb2NpLXNp
+Z25pbmctY2EwIBcNMjYwMTAxMDAwMDAwWhgPOTk5OTEyMzEyMzU5NTlaMEwxCzAJ
+BgNVBAYTAkRFMQ4wDAYDVQQKEwVNaXRlbDEUMBIGA1UECxMLRGV2ZWxvcG1lbnQx
+FzAVBgNVBAMTDm9jaS1zaWduaW5nLWNhMCowBQYDK2VwAyEAl9seyjKY9Z08Q6uF
+qGl5wWnhYiK8vqczYZgjWWOwF2mjPzA9MA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
+BBYEFH1RavYd2ysqs/WZs+CzCr3m0/jTMAsGA1UdDwQEAwIBBjAFBgMrZXADQQC9
+ms9Ru0LNfzrq/RFSXlLlHq0mic5tSPTjYjBDdEa5Euw/LY0QnR2wn3vZMI11Htr0
+cjoR4gAFMUect5LoYvIC
+-----END CERTIFICATE-----
+EOF
+)"
 
 LABEL_PREFIX="org.mitel.imagesign"
 NS="${CONTAINERD_NAMESPACE:-k8s.}"
@@ -44,8 +62,10 @@ while getopts ":i:c:r:n:h" opt; do
   esac
 done
 
-[[ -n $IMG && -n $ROOT_CA ]] || usage
-[[ -r $ROOT_CA ]] || { echo "Cannot read root CA file: $ROOT_CA" >&2; exit 1; }
+[[ -n $IMG ]] || usage
+if [[ -n $ROOT_CA ]]; then
+  [[ -r $ROOT_CA ]] || { echo "Cannot read root CA file: $ROOT_CA" >&2; exit 1; }
+fi
 
 for bin in openssl jq base64 sha256sum awk grep tr; do
   command -v "$bin" >/dev/null 2>&1 || { echo "Required tool not found: $bin" >&2; exit 1; }
@@ -75,6 +95,13 @@ LAYOUT="$WORKDIR/layout"; ARC="$WORKDIR/img.tar"
 CHAIN_PEM="$WORKDIR/chain.pem"; LEAF_PEM="$WORKDIR/leaf.pem"
 INTER_PEM="$WORKDIR/inter.pem"; PUB_PEM="$WORKDIR/pub.pem"
 DATA="$WORKDIR/data.bin"; SIG="$WORKDIR/sig.bin"
+
+# Fall back to the embedded CA when none was supplied on the command line.
+if [[ -z $ROOT_CA ]]; then
+  ROOT_CA="$WORKDIR/embedded-ca.pem"
+  printf '%s\n' "$EMBEDDED_CA" > "$ROOT_CA"
+  echo "Root CA           : using embedded fallback certificate" >&2
+fi
 
 ### ---- read diff_ids + labels from the image (store-specific) -------------
 
