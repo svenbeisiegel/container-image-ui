@@ -11,8 +11,8 @@ import {
   imageRef,
   normalizeDockerRepo,
   normalizeInspect,
-  buildExportCommand,
-  buildImportCommand,
+  buildLayoutExportSteps,
+  buildLayoutImportSteps,
   computeLayerMessage,
   verifySignature,
   verifyCertChain,
@@ -89,23 +89,54 @@ test('imageRef prefers repo:tag, falls back to id', () => {
   assert.equal(imageRef({ id: 'sha256:1', repo: '<none>', tag: '<none>' }), 'sha256:1');
 });
 
-test('buildExportCommand picks engine-specific command', () => {
-  assert.deepEqual(buildExportCommand({ engine: 'docker' }, ['a', 'b']), {
-    bin: 'docker',
-    args: ['save', 'a', 'b'],
-  });
-  assert.deepEqual(buildExportCommand({ engine: 'crictl' }, ['a']), {
-    bin: 'ctr',
-    args: ['-n', 'k8s.io', 'images', 'export', '-', 'a'],
-  });
+test('buildLayoutExportSteps copies docker images via the docker-daemon transport', () => {
+  const { steps } = buildLayoutExportSteps({ engine: 'docker' }, 'nginx:1.25', '/tmp/layout', 'img0');
+  assert.deepEqual(steps, [
+    { bin: 'skopeo', args: ['copy', 'docker-daemon:nginx:1.25', 'oci:/tmp/layout:img0'] },
+  ]);
 });
 
-test('buildImportCommand picks engine-specific command', () => {
-  assert.deepEqual(buildImportCommand({ engine: 'docker' }), { bin: 'docker', args: ['load'] });
-  assert.deepEqual(buildImportCommand({ engine: 'crictl' }), {
-    bin: 'ctr',
-    args: ['-n', 'k8s.io', 'images', 'import', '-'],
-  });
+test('buildLayoutExportSteps bridges containerd through ctr export', () => {
+  const { steps } = buildLayoutExportSteps({ engine: 'crictl' }, 'nginx:1.25', '/tmp/layout', 'img2');
+  assert.equal(steps.length, 2);
+  assert.equal(steps[0].bin, 'ctr');
+  assert.deepEqual(steps[0].args.slice(0, 4), ['-n', 'k8s.io', 'images', 'export']);
+  const tmp = steps[0].args[4];
+  assert.equal(steps[0].args[5], 'nginx:1.25');
+  assert.deepEqual(steps[1], { bin: 'skopeo', args: ['copy', `oci-archive:${tmp}`, 'oci:/tmp/layout:img2'] });
+});
+
+test('buildLayoutExportSteps copies registry images via docker:// with TLS flags', () => {
+  const caps = { engine: 'registry', registry: { host: 'h:5000', insecure: true } };
+  const { steps } = buildLayoutExportSteps(caps, 'h:5000/app:1', '/tmp/layout', 'img0');
+  assert.deepEqual(steps, [
+    { bin: 'skopeo', args: ['copy', '--src-tls-verify=false', 'docker://h:5000/app:1', 'oci:/tmp/layout:img0'] },
+  ]);
+});
+
+test('buildLayoutImportSteps loads docker images via the docker-daemon transport', () => {
+  const { steps } = buildLayoutImportSteps({ engine: 'docker' }, 'oci:/tmp/layout:img0', 'nginx:1.25');
+  assert.deepEqual(steps, [
+    { bin: 'skopeo', args: ['copy', 'oci:/tmp/layout:img0', 'docker-daemon:nginx:1.25'] },
+  ]);
+});
+
+test('buildLayoutImportSteps bridges containerd through ctr import', () => {
+  const { steps } = buildLayoutImportSteps({ engine: 'crictl' }, 'oci:/tmp/layout:img0', 'nginx:1.25');
+  assert.equal(steps.length, 2);
+  // The ctr import step names the intermediate archive; the skopeo step writes it.
+  assert.deepEqual(steps[1].args.slice(0, 4), ['-n', 'k8s.io', 'images', 'import']);
+  const tmp = steps[1].args[4];
+  assert.equal(steps[1].bin, 'ctr');
+  assert.deepEqual(steps[0], { bin: 'skopeo', args: ['copy', 'oci:/tmp/layout:img0', `oci-archive:${tmp}:nginx:1.25`] });
+});
+
+test('buildLayoutImportSteps maps registry refs under our host', () => {
+  const caps = { engine: 'registry', registry: { host: 'h:5000', insecure: false } };
+  const { steps } = buildLayoutImportSteps(caps, 'oci:/tmp/layout:img0', 'docker.io/library/nginx:latest');
+  assert.deepEqual(steps, [
+    { bin: 'skopeo', args: ['copy', 'oci:/tmp/layout:img0', 'docker://h:5000/library/nginx:latest'] },
+  ]);
 });
 
 test('normalizeInspect extracts docker fields', () => {

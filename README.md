@@ -20,16 +20,17 @@ A zero-dependency, Node.js web UI for managing container images. Supports three 
 
 - **Node.js >= 24**
 - `tar`, `xz`, and `gzip` on `PATH`
+- **`skopeo`** — used by every backend for all image download/upload (into and out of a portable OCI image layout) and for all registry operations.
 
-**Backend-specific requirements** (one of the following):
+**Backend-specific requirements** (one of the following selects the backend):
 
 | Backend | Required binaries | Notes |
 |---------|------------------|-------|
-| Registry | `skopeo` | Hard requirement. `REGISTRY_URL` must be set and reachable. |
-| Docker | `docker` | All features available. |
-| crictl | `crictl` | List/inspect/delete/verify always work. Download/upload additionally require `ctr` (containerd). |
+| Registry | (skopeo) | `REGISTRY_URL` must be set and reachable. |
+| Docker | `docker` | skopeo reads/writes the daemon via the `docker-daemon:` transport. |
+| crictl | `crictl` | List/inspect/delete/verify always work. Download/upload additionally require `ctr` (containerd has no skopeo transport, so it is bridged through `ctr`). |
 
-The tool detects prerequisites at startup and exits with a descriptive error if a hard requirement is missing.
+The tool detects prerequisites at startup and exits with a descriptive error if a hard requirement (including skopeo) is missing.
 
 ## Quick start
 
@@ -98,20 +99,22 @@ Container engine: crictl
 | Delete | ✓ | ✓ | ✓ |
 | Signature verify | ✓ | ✓ | ✓ |
 | Pull | ✓ (skopeo copy) | ✓ | ✓ |
-| Download | ✓ (OCI layout tar.xz) | ✓ | ✓ with `ctr` |
-| Upload | ✓ (skopeo copy) | ✓ | ✓ with `ctr` |
+| Download | ✓ | ✓ | ✓ with `ctr` |
+| Upload | ✓ | ✓ | ✓ with `ctr` |
 
 ## Download / upload archive format
 
-### Docker / crictl backend
+**All backends use a single, portable format**, so an image downloaded from one instance of the tool can be uploaded into another regardless of backend (registry → docker → containerd, in any direction).
 
-Archives are standard `docker save` tarballs, compressed with xz. They can be loaded with `docker load` or `ctr images import`.
+Archives use the **OCI image layout** format, tar'd and xz-compressed (`.tar.xz`). Each selected image is copied into the layout (with `skopeo`) as `img0`, `img1`, … entries. A `refs.json` sidecar maps each slot back to its original reference so that upload restores the images under their original names.
 
-### Registry backend
+On download, skopeo reads each image from the active backend:
 
-Archives use the **OCI image layout** format, tar'd and xz-compressed. Each image is stored as `img0`, `img1`, … entries. A `refs.json` sidecar maps each slot back to its original registry reference so that upload restores the images under their original paths.
+- Registry → `docker://<host>/<repo>:<tag>`
+- Docker → `docker-daemon:<ref>`
+- containerd → bridged through `ctr images export` into an intermediate OCI archive that skopeo then reads.
 
-Archives produced by this tool can be pushed back to the same (or another) registry via the Upload function. Standard `docker save` archives can also be uploaded; the tool detects the archive type automatically.
+On upload, the same steps run in reverse to load each image back into the active backend. Standard `docker save` / OCI archives produced by other tools can also be uploaded; the tool detects the archive type automatically.
 
 ## Image signing
 
