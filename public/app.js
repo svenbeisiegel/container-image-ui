@@ -3,7 +3,7 @@
 const state = {
   images: [],
   selected: new Set(),
-  caps: { engine: '', canExport: false, canImport: false },
+  caps: { engine: '', canPull: false, canExport: false, canImport: false },
   openMenuKey: null,
   /** Map<imageId, {status, reason?}> — populated asynchronously after render. */
   signatures: new Map(),
@@ -111,6 +111,11 @@ async function loadCapabilities() {
     el.uploadLabel.style.opacity = '0.5';
     el.uploadLabel.style.pointerEvents = 'none';
   }
+  if (!state.caps.canPull) {
+    el.pullBtn.disabled = true;
+    el.pullBtn.setAttribute('title', 'Pull not supported in this environment');
+    el.pullBtn.style.opacity = '0.5';
+  }
 }
 
 async function loadImages() {
@@ -213,15 +218,25 @@ function patchSigIcons(statuses) {
   }
 }
 
-/** Collect unique ids from current image list and verify them in one batch. */
+/**
+ * Verify all images in one batch. Sends one { id, ref } per unique image id:
+ * the ref is needed because a bare digest cannot be inspected against a remote
+ * registry. The response is keyed by id so icons can be patched in place.
+ */
 async function verifyAllImages() {
   if (state.images.length === 0) return;
-  const ids = [...new Set(state.images.map((img) => img.id))];
+  const seen = new Set();
+  const items = [];
+  for (const img of state.images) {
+    if (seen.has(img.id)) continue;
+    seen.add(img.id);
+    items.push({ id: img.id, ref: rowRef(img) });
+  }
   try {
     const data = await api('/api/images/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify({ items }),
     });
     patchSigIcons(data.statuses || {});
   } catch {

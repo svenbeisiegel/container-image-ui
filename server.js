@@ -4,14 +4,15 @@
 // and its JSON/streaming API.
 
 import http from 'node:http';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { stat, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { initialize, spawnStream } from './lib/cli.js';
+import { initialize, spawnStream, run } from './lib/cli.js';
+import * as registry from './lib/registry.js';
 import {
   listImages,
   inspectImage,
@@ -240,6 +241,25 @@ function sseSpawn(res, bin, args, { endStream = true } = {}) {
   });
 }
 
+/**
+ * Run an async task, streaming progress lines via `emit(text)` as SSE, and
+ * resolve with { ok, code }. The registry backend uses this in place of
+ * `sseSpawn` for operations that are HTTP calls rather than child processes.
+ * When endStream is false the response is kept open (caller sends `done`).
+ */
+async function sseRun(res, task, { endStream = true } = {}) {
+  const emit = (text) => sseSend(res, text);
+  try {
+    await task(emit);
+    if (endStream) sseDone(res, { ok: true, code: 0 });
+    return { ok: true, code: 0 };
+  } catch (err) {
+    emit(`Error: ${(err && err.message) || err}`);
+    if (endStream) sseDone(res, { ok: false, code: 1 });
+    return { ok: false, code: 1 };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Static files
 // ---------------------------------------------------------------------------
@@ -276,6 +296,7 @@ async function serveStatic(req, res, urlPath) {
 function handleCapabilities(req, res) {
   sendJson(res, 200, {
     engine: caps.engine,
+    canPull: caps.canPull,
     canExport: caps.canExport,
     canImport: caps.canImport,
   });
@@ -313,26 +334,40 @@ async function handleVerify(req, res) {
     sendError(res, 400, 'Invalid request body');
     return;
   }
-  const ids = parseIds(body);
-  if (!ids) {
-    sendError(res, 400, 'Expected a non-empty "ids" array');
+  // Accept either { items: [{ id, ref }] } (preferred — a bare digest cannot be
+  // inspected against a registry, so the caller supplies a ref) or a legacy
+  // { ids: [...] } array. The response is always keyed by image id.
+  const items = parseVerifyItems(body);
+  if (!items) {
+    sendError(res, 400, 'Expected a non-empty "items" or "ids" array');
     return;
   }
-  // Inspect all requested ids in parallel and verify each.
+  // Inspect each image in parallel (by ref) and verify its signature.
   const entries = await Promise.all(
-    ids.map(async (id) => {
+    items.map(async ({ id, ref }) => {
       try {
-        const result = await inspectImage(caps, id);
+        const result = await inspectImage(caps, ref);
         const d = result.details;
-        return [result.id, verifySignature(d.labels, d.layers, trustedRoots)];
+        return [id, verifySignature(d.labels, d.layers, trustedRoots)];
       } catch {
         // If inspect fails we cannot determine signature state.
         return [id, { status: 'invalid', reason: 'Inspect failed' }];
       }
     }),
   );
-  const statuses = Object.fromEntries(entries);
-  sendJson(res, 200, { statuses });
+  sendJson(res, 200, { statuses: Object.fromEntries(entries) });
+}
+
+/** Normalize a verify request body to a list of { id, ref } pairs. */
+function parseVerifyItems(body) {
+  if (body && Array.isArray(body.items)) {
+    const items = body.items
+      .filter((it) => it && isValidRef(it.id) && isValidRef(it.ref))
+      .map((it) => ({ id: it.id, ref: it.ref }));
+    return items.length > 0 ? items : null;
+  }
+  const ids = parseIds(body);
+  return ids ? ids.map((id) => ({ id, ref: id })) : null;
 }
 
 async function handleDelete(req, res) {
@@ -405,6 +440,25 @@ async function handleStreamDelete(req, res, query) {
     return;
   }
   sseStart(res);
+
+  // Registry backend: deletion is an HTTP call, not a spawned binary.
+  if (caps.engine === 'registry') {
+    let ok = true;
+    for (const id of ids) {
+      if (res.writableEnded) return;
+      sseSend(res, `Deleting ${id} from registry…`);
+      const { errors } = await deleteImages(caps, [id]);
+      if (errors.length > 0) {
+        ok = false;
+        sseSend(res, errors[0].message);
+      } else {
+        sseSend(res, `Deleted ${id}`);
+      }
+    }
+    if (!res.writableEnded) sseDone(res, { ok, code: ok ? 0 : 1 });
+    return;
+  }
+
   let allOk = true;
   for (let i = 0; i < ids.length; i++) {
     if (res.writableEnded) return;
@@ -442,6 +496,12 @@ async function handleStreamUpload(req, res, query) {
   sseSend(res, `Importing ${query.get('filename') || 'archive'}…`);
   debug(`upload import: filename="${query.get('filename') || ''}" decompressor=${decompressor ? decompressor.bin : 'none'}`);
 
+  // Registry backend: stream the archive to disk, then push it with skopeo.
+  if (caps.engine === 'registry') {
+    await streamRegistryUpload(req, res, decompressor);
+    return;
+  }
+
   const importer = spawnImport(caps);
   importer.stdout.on('data', (d) => sseSend(res, d.toString()));
   importer.stderr.on('data', (d) => sseSend(res, d.toString()));
@@ -467,9 +527,7 @@ async function handleStreamUpload(req, res, query) {
   });
 
   importer.on('close', (code) => {
-    if (!res.writableEnded) {
-      sseDone(res, { ok: code === 0, code });
-    }
+    if (!res.writableEnded) sseDone(res, { ok: code === 0, code });
   });
 
   req.on('error', () => {
@@ -481,6 +539,124 @@ async function handleStreamUpload(req, res, query) {
     safeKill(importer);
     safeKill(decomp);
   });
+}
+
+/** Read the image references contained in a local archive via skopeo inspect. */
+async function archiveTags(tmpTar, transport) {
+  const { stdout } = await run('skopeo', ['inspect', `${transport}:${tmpTar}`]);
+  const meta = JSON.parse(stdout);
+  if (Array.isArray(meta.RepoTags) && meta.RepoTags.length > 0) return meta.RepoTags;
+  return meta.Name ? [meta.Name] : [];
+}
+
+/**
+ * Inspect an uploaded archive and produce the list of skopeo copy jobs that push
+ * its images into the registry, plus a cleanup function.
+ *
+ * Two archive shapes are supported:
+ *   1. Our own download — a tarred OCI layout carrying a `refs.json` sidecar;
+ *      each image is pushed back under the repository it came from.
+ *   2. A `docker save` / OCI archive — its embedded RepoTags are used directly.
+ *
+ * @returns {Promise<{ jobs: {src: string, dest: string}[], cleanup: () => void }>}
+ */
+async function planArchivePush(tmpTar) {
+  const cleanups = [() => unlink(tmpTar).catch(() => {})];
+  const cleanup = () => cleanups.forEach((c) => c());
+
+  let entries = '';
+  try {
+    entries = (await run('tar', ['-tf', tmpTar])).stdout;
+  } catch {
+    /* not a tar we can list; fall through to archive transports */
+  }
+  const isOurLayout = /(^|\/)refs\.json$/m.test(entries) && /(^|\/)oci-layout$/m.test(entries);
+
+  if (isOurLayout) {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'container-ui-ul-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    await run('tar', ['-C', dir, '-xf', tmpTar]);
+    const refs = JSON.parse(readFileSync(path.join(dir, 'refs.json'), 'utf8'));
+    const jobs = refs.map((ref, i) => ({
+      src: `oci:${dir}:img${i}`,
+      dest: `docker://${registry.destRefForPull(caps.registry, ref)}`,
+    }));
+    return { jobs, cleanup };
+  }
+
+  // A docker save / OCI archive: copy each tag it carries straight from the tar.
+  let transport = 'docker-archive';
+  let tags = [];
+  try {
+    tags = await archiveTags(tmpTar, 'docker-archive');
+  } catch {
+    try {
+      transport = 'oci-archive';
+      tags = await archiveTags(tmpTar, 'oci-archive');
+    } catch {
+      tags = [];
+    }
+  }
+  const jobs = tags.map((tag) => ({
+    src: `${transport}:${tmpTar}:${tag}`,
+    dest: `docker://${registry.destRefForPull(caps.registry, tag)}`,
+  }));
+  return { jobs, cleanup };
+}
+
+/** Stream an uploaded request body (decompressing as needed) to a temp file. */
+function receiveArchive(req, res, decompressor, tmpTar) {
+  return new Promise((resolve) => {
+    const out = createWriteStream(tmpTar, { mode: 0o600 });
+    let decomp = null;
+    out.on('error', () => resolve(false));
+    out.on('finish', () => resolve(true));
+    if (decompressor) {
+      decomp = spawnStream(decompressor.bin, decompressor.args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      if (res) decomp.stderr.on('data', (d) => sseSend(res, d.toString()));
+      decomp.on('error', () => resolve(false));
+      decomp.stdout.pipe(out);
+      req.pipe(decomp.stdin);
+    } else {
+      req.pipe(out);
+    }
+    req.on('error', () => resolve(false));
+  });
+}
+
+/**
+ * Stream an uploaded archive to disk, then push each image it contains into the
+ * registry with skopeo. Progress is sent as SSE.
+ */
+async function streamRegistryUpload(req, res, decompressor) {
+  const tmpTar = path.join(os.tmpdir(), `container-ui-${randomUUID()}.tar`);
+
+  const received = await receiveArchive(req, res, decompressor, tmpTar);
+  if (!received) {
+    sseSend(res, 'Failed to receive the uploaded archive.');
+    if (!res.writableEnded) sseDone(res, { ok: false, code: 1 });
+    unlink(tmpTar).catch(() => {});
+    return;
+  }
+
+  const { jobs, cleanup } = await planArchivePush(tmpTar);
+  if (jobs.length === 0) {
+    sseSend(res, 'No tagged image found in the archive to push to the registry.');
+    if (!res.writableEnded) sseDone(res, { ok: false, code: 1 });
+    cleanup();
+    return;
+  }
+
+  let ok = true;
+  for (const job of jobs) {
+    if (res.writableEnded) break;
+    const args = registry.buildCopyArgs(caps.registry, job.src, job.dest);
+    sseSend(res, `$ skopeo ${args.join(' ')}`);
+    const r = await sseSpawn(res, 'skopeo', args, { endStream: false });
+    if (!r.ok) ok = false;
+  }
+  cleanup();
+  if (!res.writableEnded) sseDone(res, { ok, code: ok ? 0 : 1 });
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +695,87 @@ function formatBytes(n) {
 }
 
 /**
+ * Registry download: copy each selected image into a shared OCI image layout
+ * with skopeo (an OCI layout, unlike a docker-archive, holds many images), then
+ * tar + xz the layout into a single archive and hand back a one-time token.
+ *
+ * A `refs.json` sidecar records each image's original reference (index-aligned
+ * to the `img0`, `img1`, … layout tags) so the upload path can push them back
+ * under the right repositories. Progress is streamed as SSE.
+ */
+async function streamRegistryDownload(res, ids, filename) {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'container-ui-dl-'));
+  const tmpXz = path.join(os.tmpdir(), `container-ui-${randomUUID()}.tar.xz`);
+  const cleanupDir = () => rmSync(tmpDir, { recursive: true, force: true });
+  const fail = () => {
+    if (!res.writableEnded) sseDone(res, { ok: false, code: 1 });
+    cleanupDir();
+    unlink(tmpXz).catch(() => {});
+  };
+
+  // 1. Copy each image into the OCI layout under a simple, safe tag.
+  for (let i = 0; i < ids.length; i++) {
+    if (res.writableEnded) {
+      cleanupDir();
+      return;
+    }
+    const args = registry.buildCopyArgs(caps.registry, `docker://${ids[i]}`, `oci:${tmpDir}:img${i}`);
+    sseSend(res, `$ skopeo ${args.join(' ')}`);
+    const { ok } = await sseSpawn(res, 'skopeo', args, { endStream: false });
+    if (!ok) {
+      fail();
+      return;
+    }
+  }
+  writeFileSync(path.join(tmpDir, 'refs.json'), JSON.stringify(ids));
+
+  // 2. tar the layout and compress: tar -C dir -cf - . | xz > tmpXz
+  sseSend(res, `$ tar -C <layout> -cf - . | xz -z -T 0 > ${filename}`);
+  const ok = await new Promise((resolve) => {
+    const tar = spawnStream('tar', ['-C', tmpDir, '-cf', '-', '.'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const xz = spawnStream('xz', ['-z', '-c', '-T', '0'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const out = createWriteStream(tmpXz, { mode: 0o600 });
+    let xzCode = null;
+    let finished = false;
+    let settled = false;
+    const settle = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    // Resolve true only once xz exited 0 *and* the file finished writing.
+    const maybeOk = () => {
+      if (xzCode === 0 && finished) settle(true);
+    };
+    tar.stderr.on('data', (d) => sseSend(res, d.toString()));
+    xz.stderr.on('data', (d) => sseSend(res, d.toString()));
+    tar.on('error', () => settle(false));
+    xz.on('error', () => settle(false));
+    out.on('error', () => settle(false));
+    tar.stdout.pipe(xz.stdin);
+    xz.stdout.pipe(out);
+    xz.on('close', (code) => {
+      xzCode = code;
+      if (code !== 0) settle(false);
+      else maybeOk();
+    });
+    out.on('finish', () => {
+      finished = true;
+      maybeOk();
+    });
+  });
+  if (!ok) {
+    fail();
+    return;
+  }
+
+  cleanupDir();
+  const token = registerDownload(tmpXz, filename);
+  sseSend(res, `Archive ready: ${filename}`);
+  if (!res.writableEnded) sseDone(res, { ok: true, code: 0, token, filename });
+}
+
+/**
  * SSE-streaming export: GET /api/stream/download?ids=a,b
  * Pipeline: export(stdout) -> xz(stdin->stdout) -> temp file.
  * stderr of both processes is streamed as SSE; on success the `done` event
@@ -539,6 +796,13 @@ async function handleStreamDownload(req, res, query) {
   const tmpPath = path.join(os.tmpdir(), `container-ui-${randomUUID()}.tar.xz`);
 
   sseStart(res);
+
+  // Registry backend: build the archive with skopeo (no local engine involved).
+  if (caps.engine === 'registry') {
+    await streamRegistryDownload(res, ids, filename);
+    return;
+  }
+
   const exportCmd = buildExportCommand(caps, ids);
   sseSend(res, `$ ${exportCmd.bin} ${exportCmd.args.join(' ')} | xz -z -c -T 0 > ${filename}`);
   debug(`download export: ${exportCmd.bin} ${exportCmd.args.join(' ')} -> ${tmpPath}`);
@@ -670,6 +934,44 @@ async function handleDownload(req, res) {
 
   const filename = ids.length === 1 ? 'image.tar.xz' : 'images.tar.xz';
 
+  // Registry backend: copy images into an OCI layout with skopeo, then stream
+  // it (tar | xz) to the client. (An OCI layout holds many images; a
+  // docker-archive cannot.) A refs.json sidecar records the original refs.
+  if (caps.engine === 'registry') {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'container-ui-dl-'));
+    const dropDir = () => rmSync(tmpDir, { recursive: true, force: true });
+    try {
+      for (let i = 0; i < ids.length; i++) {
+        await run('skopeo', registry.buildCopyArgs(caps.registry, `docker://${ids[i]}`, `oci:${tmpDir}:img${i}`));
+      }
+      writeFileSync(path.join(tmpDir, 'refs.json'), JSON.stringify(ids));
+    } catch (err) {
+      dropDir();
+      sendError(res, 500, `Export failed: ${(err.stderr || err.message || '').trim()}`);
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'application/x-xz',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+    });
+    const tar = spawnStream('tar', ['-C', tmpDir, '-cf', '-', '.'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const xz = spawnStream('xz', ['-z', '-c', '-T', '0'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    tar.stdout.pipe(xz.stdin);
+    xz.stdout.pipe(res);
+    const done = () => dropDir();
+    xz.on('close', done);
+    tar.on('error', () => res.destroy());
+    xz.on('error', () => {
+      dropDir();
+      res.destroy();
+    });
+    res.on('close', () => {
+      safeKill(tar);
+      safeKill(xz);
+    });
+    return;
+  }
+
   const exporter = spawnExport(caps, ids);
   const xz = spawnStream('xz', ['-z', '-c', '-T', '0'], { stdio: ['pipe', 'pipe', 'pipe'] });
 
@@ -740,6 +1042,37 @@ async function handleUpload(req, res, query) {
   const decompressor = decompressorFor(filename);
   if (decompressor === undefined) {
     sendError(res, 400, 'Unsupported file type. Use .tar, .tar.gz/.tgz, or .tar.xz');
+    return;
+  }
+
+  // Registry backend: receive to a temp file, then push with skopeo.
+  if (caps.engine === 'registry') {
+    const tmpTar = path.join(os.tmpdir(), `container-ui-${randomUUID()}.tar`);
+    const received = await receiveArchive(req, null, decompressor, tmpTar);
+    if (!received) {
+      unlink(tmpTar).catch(() => {});
+      sendError(res, 500, 'Failed to receive the uploaded archive');
+      return;
+    }
+    const { jobs, cleanup } = await planArchivePush(tmpTar);
+    if (jobs.length === 0) {
+      cleanup();
+      sendError(res, 500, 'No tagged image found in the archive to push to the registry');
+      return;
+    }
+    const pushed = [];
+    try {
+      for (const job of jobs) {
+        const { stdout, stderr } = await run('skopeo', registry.buildCopyArgs(caps.registry, job.src, job.dest));
+        pushed.push((stdout || stderr || '').trim());
+      }
+    } catch (err) {
+      cleanup();
+      sendError(res, 500, `Push failed: ${(err.stderr || err.message || '').trim()}`);
+      return;
+    }
+    cleanup();
+    sendJson(res, 200, { ok: true, output: pushed.join('\n').trim() });
     return;
   }
 

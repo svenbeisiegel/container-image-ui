@@ -160,6 +160,28 @@ test('normalizeInspect extracts crictl fields', () => {
   assert.deepEqual(d.labels, { 'org.opencontainers.image.vendor': 'Mitel' });
 });
 
+test('normalizeInspect extracts registry config-blob fields', () => {
+  // An OCI image config blob (what GET /v2/<repo>/blobs/<config-digest> returns).
+  const obj = {
+    architecture: 'amd64',
+    os: 'linux',
+    config: {
+      Cmd: ['/bin/sh'],
+      Env: ['PATH=/usr/bin'],
+      ExposedPorts: { '8080/tcp': {} },
+      Labels: { 'org.opencontainers.image.vendor': 'ACME' },
+    },
+    rootfs: { type: 'layers', diff_ids: ['sha256:aaa', 'sha256:bbb'] },
+  };
+  const d = normalizeInspect('registry', obj, 'sha256:digest');
+  assert.equal(d.os, 'linux');
+  assert.equal(d.architecture, 'amd64');
+  assert.deepEqual(d.cmd, ['/bin/sh']);
+  assert.deepEqual(d.exposedPorts, ['8080/tcp']);
+  assert.deepEqual(d.layers, ['sha256:aaa', 'sha256:bbb']);
+  assert.deepEqual(d.labels, { 'org.opencontainers.image.vendor': 'ACME' });
+});
+
 test('normalizeInspect returns null for missing values', () => {
   const d = normalizeInspect('docker', { Id: 'x' }, 'x');
   assert.equal(d.os, null);
@@ -276,6 +298,23 @@ test('verifySignature returns "unsigned" for empty labels', () => {
 test('verifySignature returns "valid" for a correctly signed image', () => {
   const layers = ['sha256:a344a5d4ea4bb4e872c37f9f39277655edec697e9b6e430e2a5331b57a8810e8'];
   const result = verifySignature(signedLabels(layers), layers, trustedRoots);
+  assert.equal(result.status, 'valid');
+  assert.equal(result.signature, 'valid');
+  assert.equal(result.chain, 'valid');
+});
+
+test('verifySignature works on a registry config blob (cross-backend parity)', () => {
+  const layers = ['sha256:a344a5d4ea4bb4e872c37f9f39277655edec697e9b6e430e2a5331b57a8810e8'];
+  // Simulate the registry path: a config blob with signing labels, normalized,
+  // then verified — must match the docker/crictl result exactly.
+  const configBlob = {
+    architecture: 'amd64',
+    os: 'linux',
+    config: { Labels: signedLabels(layers) },
+    rootfs: { type: 'layers', diff_ids: layers },
+  };
+  const d = normalizeInspect('registry', configBlob, 'sha256:digest');
+  const result = verifySignature(d.labels, d.layers, trustedRoots);
   assert.equal(result.status, 'valid');
   assert.equal(result.signature, 'valid');
   assert.equal(result.chain, 'valid');
