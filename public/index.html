@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Container Images</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>Container Images</h1>
+      <div class="engine-badge" id="engineBadge" hidden></div>
+    </header>
+
+    <main class="container">
+      <section class="toolbar">
+        <div class="toolbar-left">
+          <button class="btn" id="refreshBtn" type="button">Refresh</button>
+          <label class="btn btn-upload" id="uploadLabel">
+            Upload
+            <input type="file" id="uploadInput" hidden />
+          </label>
+          <button class="btn" id="pullBtn" type="button">Pull</button>
+        </div>
+        <div class="bulk-bar" id="bulkBar" hidden>
+          <span class="bulk-count" id="bulkCount">0 selected</span>
+          <button class="btn" id="bulkDownloadBtn" type="button">Download</button>
+          <button class="btn btn-danger" id="bulkDeleteBtn" type="button">Delete</button>
+        </div>
+      </section>
+
+      <div class="dropzone" id="dropzone" hidden>Drop a tar / tar.gz / tar.xz archive to import</div>
+
+      <div class="table-wrap">
+        <table class="jira-table" id="imagesTable">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" id="selectAll" /></th>
+              <th class="col-image">Image</th>
+              <th class="col-tag">Tag</th>
+              <th class="col-size">Size</th>
+              <th class="col-actions" aria-label="Actions"></th>
+            </tr>
+          </thead>
+          <tbody id="imagesBody">
+            <tr class="empty-row">
+              <td colspan="5">Loading…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <div class="modal-backdrop" id="detailsModal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="detailsTitle">
+        <div class="modal-header">
+          <h2 id="detailsTitle">Image details</h2>
+          <button class="modal-close" id="detailsClose" type="button" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body" id="detailsBody"></div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="pullModal" hidden>
+      <div class="modal pull-modal" id="pullDialog" role="dialog" aria-modal="true" aria-labelledby="pullTitle">
+        <div class="modal-header">
+          <h2 id="pullTitle">Pull image</h2>
+          <button class="modal-close" id="pullClose" type="button" aria-label="Close">&times;</button>
+        </div>
+        <form class="modal-body" id="pullForm">
+          <label class="pull-label" for="pullInput">Image reference</label>
+          <input
+            type="text"
+            id="pullInput"
+            class="pull-input"
+            placeholder="e.g. docker.io/library/nginx:latest"
+            autocomplete="off"
+          />
+          <div class="modal-actions">
+            <button type="button" class="btn" id="pullCancel">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="pullSubmit">Pull</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+
+    <div class="modal-backdrop" id="progressModal" hidden>
+      <div class="modal progress-modal" role="dialog" aria-modal="true" aria-labelledby="progressTitle">
+        <div class="modal-header">
+          <h2 id="progressTitle">Progress</h2>
+          <button class="modal-close" id="progressClose" type="button" aria-label="Close" disabled>&times;</button>
+        </div>
+        <div class="modal-body">
+          <pre class="progress-output" id="progressOutput"></pre>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
